@@ -815,11 +815,6 @@ def build_rows(df, mapping, meta):
 
     out["vat_status"] = meta.get(
         "vat_status",
-    "fx_rate_to_sar",
-    "fx_date",
-    "fx_source",
-    "normalized_price_sar",
-    "normalization_status",
         "VAT_UNKNOWN"
     )
 
