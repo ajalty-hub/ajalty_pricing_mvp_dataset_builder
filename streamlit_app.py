@@ -1,1540 +1,514 @@
-
 import io
 import re
-from datetime import date
+import math
+import hashlib
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+st.set_page_config(page_title="Ajalty Pricing Engine MVP — R03", layout="wide")
 
 # ============================================================
-# Ajalty Intelligent Pricing Engine — MVP
-# G1 Dataset Builder / R02
-#
-# Design principles:
-# - Multiple files can be added sequentially.
-# - Each file has its own source/market/brand context.
-# - Toyota is the current MVP scope, but is NOT hard-coded.
-# - Missing brand can be assigned explicitly at file level.
-# - Raw observed price is preserved.
-# - Benchmark adjustment is separate from observed price.
-# - No pricing prediction is performed here.
+# R03
+# Deterministic dataset builder only.
+# Core principles:
+# - raw observations remain immutable
+# - observed price != benchmark price
+# - explicit currency in raw price wins over file-level currency
+# - file-level brand is applied when no brand column is mapped
+# - parsing status is explicit; no silent conversion
 # ============================================================
 
-st.set_page_config(
-    page_title="Ajalty Pricing Engine — Dataset Builder",
-    layout="wide",
-)
-
-# ------------------------------------------------------------
-# Canonical dataset schema
-# ------------------------------------------------------------
-
-CANONICAL_FIELDS = [
-    "part_number",
-    "normalized_part_number",
-    "brand",
-    "brand_source",
-    "description",
-    "category",
-    "market",
-    "country",
-    "currency",
-    "price",
-    "price_ex_vat",
-    "price_inc_vat",
-    "vat_rate",
-    "vat_status",
-    "quantity",
-    "price_type",
-    "supplier",
-    "supplier_type",
-    "authorized_status",
-    "source",
-    "source_type",
-    "price_evidence_level",
-    "observation_date",
-    "source_url",
-    "source_location",
-    "shipping_adjustment_pct",
-    "shipping_adjustment",
-    "benchmark_price",
-    "valid",
-    "rejection_reason",
-    "notes",
-    "source_file",
-    "source_sheet",
-]
-
-# Current MVP scope only. Architecture remains dynamic.
 MVP_ALLOWED_BRANDS = ["TOYOTA"]
 
-SOURCE_PRESETS = {
-    "KSA dealership genuine pricing": {
-        "source_type": "DEALERSHIP",
-        "market": "Saudi Arabia",
-        "country": "Saudi Arabia",
-        "currency": "SAR",
-        "price_type": "WHOLESALE",
-        "price_evidence_level": 1,
-        "supplier_type": "Authorized/Dealership",
-        "authorized_status": "CONFIRMED",
-        "source_location": "Saudi Arabia",
-    },
-    "KSA Mendoubak marketplace": {
-        "source_type": "MARKETPLACE",
-        "market": "Saudi Arabia",
-        "country": "Saudi Arabia",
-        "currency": "SAR",
-        "price_type": "MARKETPLACE",
-        "price_evidence_level": 5,
-        "supplier_type": "Marketplace seller",
-        "authorized_status": "UNKNOWN",
-        "source_location": "Saudi Arabia",
-    },
-    "Ajalty / Saudi client transaction": {
-        "source_type": "ACTUAL_TRANSACTION",
-        "market": "Saudi Arabia",
-        "country": "Saudi Arabia",
-        "currency": "AED",
-        "price_type": "TRANSACTION",
-        "price_evidence_level": 1,
-        "supplier_type": "Ajalty",
-        "authorized_status": "N/A",
-        "source_location": "Jebel Ali, UAE",
-    },
-    "Other / custom": {
-        "source_type": "OTHER",
-        "market": "",
-        "country": "",
-        "currency": "",
-        "price_type": "UNKNOWN",
-        "price_evidence_level": 5,
-        "supplier_type": "",
-        "authorized_status": "UNKNOWN",
-        "source_location": "",
-    },
-}
-
-FIELD_ALIASES = {
-    "part_number": [
-        "part number", "part_number", "part no", "part no.",
-        "item", "item number", "pn", "clean pn",
-        "part", "رقم الصنف"
-    ],
-    "description": ["description", "desc", "product", "الوصف"],
-    "quantity": ["qty", "quantity", "order qty", "الكمية"],
-    "price": [
-        "price", "new price aed", "new price", "target price",
-        "target price ", "unit price", "selling price", "purchase price"
-    ],
-    "currency": ["currency", "curr"],
-    "brand": ["brand", "make", "manufacturer", "oem brand"],
-    "category": ["category", "product category", "type"],
-    "date": ["date", "order date", "observation date"],
-    "source_url": ["source url", "url", "link"],
-    "vat_rate": ["vat", "vat rate", "tax", "tax rate"],
-    "supplier": ["supplier", "seller", "vendor"],
-}
-
-PRICE_TYPES = [
-    "WHOLESALE",
-    "TRADE",
-    "DISTRIBUTOR",
-    "DEALER",
-    "RETAIL",
-    "MSRP",
-    "PUBLIC_OEM",
-    "MARKETPLACE",
-    "QUOTE",
-    "TRANSACTION",
-    "UNKNOWN",
+CANONICAL_COLUMNS = [
+    "source_file", "source_sheet",
+    "part_number", "normalized_part_number",
+    "brand", "brand_source",
+    "description", "category",
+    "market", "country", "currency",
+    "raw_price", "price", "price_parse_status",
+    "price_ex_vat", "price_inc_vat", "vat_rate", "vat_status",
+    "quantity", "price_type",
+    "supplier", "supplier_type", "authorized_status",
+    "source", "source_type", "price_evidence_level",
+    "observation_date", "source_url",
+    "source_location",
+    "shipping_adjustment_pct", "shipping_adjustment", "benchmark_price",
+    "valid", "rejection_reason", "notes"
 ]
 
-SOURCE_TYPES = [
-    "DEALERSHIP",
-    "MARKETPLACE",
-    "ACTUAL_TRANSACTION",
-    "SUPPLIER",
-    "OEM",
-    "OTHER",
+CURRENCY_CODES = [
+    "SAR", "AED", "USD", "EUR", "GBP", "JPY", "CNY", "THB", "MYR",
+    "KWD", "BHD", "QAR", "OMR", "INR", "RUB", "TRY", "SGD", "AUD",
+    "CAD", "HKD"
 ]
 
-BRAND_SOURCE_OPTIONS = [
-    "COLUMN_IN_FILE",
-    "USER_ASSIGNED_FILE_LEVEL",
-    "USER_ASSIGNED_ROW_LEVEL",
-    "EXTERNAL_VERIFICATION",
-    "UNKNOWN",
-]
-
-
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-
-def clean_col(value):
-    if value is None:
-        return ""
-    return str(value).strip().lower().replace("\n", " ")
-
+PRICE_STATUS = ["EXTRACTED", "CONTEXT", "MISSING", "AMBIGUOUS"]
 
 def normalize_part_number(value):
     if pd.isna(value):
         return ""
     s = str(value).strip().upper()
-    return re.sub(r"[\s\-_./]+", "", s)
+    # Preserve alphanumeric identity while normalizing common separators.
+    s = re.sub(r"[\s\-_./]+", "", s)
+    return s
 
+def clean_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
 
-def parse_numeric(value):
-    if pd.isna(value) or value == "":
+def detect_currency(raw):
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
         return None
+    s = str(raw).upper()
+    # Longest / most explicit tokens first.
+    for code in sorted(CURRENCY_CODES, key=len, reverse=True):
+        if re.search(rf"(?<![A-Z]){re.escape(code)}(?![A-Z])", s):
+            return code
+    # Common symbols
+    if "﷼" in s:
+        return "SAR"
+    if "د.إ" in s or "AED" in s:
+        return "AED"
+    if "$" in s:
+        return "USD"
+    if "€" in s:
+        return "EUR"
+    if "£" in s:
+        return "GBP"
+    if "¥" in s:
+        return "JPY"
+    return None
 
-    if isinstance(value, (int, float)):
-        return float(value)
+def parse_price(raw_value, fallback_currency=None):
+    """
+    Returns:
+      numeric price,
+      detected currency or fallback currency,
+      parse status,
+      reason
+    Examples:
+      100 SAR      -> 100, SAR, EXTRACTED
+      SAR 100      -> 100, SAR, EXTRACTED
+      1,250 SAR    -> 1250, SAR, EXTRACTED
+      100           -> 100, fallback, CONTEXT
+      100 USD       -> 100, USD, EXTRACTED
+    """
+    if raw_value is None or (isinstance(raw_value, float) and math.isnan(raw_value)):
+        return None, fallback_currency, "MISSING", "missing_price"
 
-    s = str(value).strip()
-    s = re.sub(r"[^\d,.\-]", "", s)
+    raw = str(raw_value).strip()
+    if not raw:
+        return None, fallback_currency, "MISSING", "missing_price"
 
-    if not s:
-        return None
+    currency = detect_currency(raw)
 
-    if "," in s and "." not in s:
-        s = s.replace(",", ".")
-    else:
-        s = s.replace(",", "")
+    # Remove currency words/symbols and common commercial suffixes.
+    cleaned = raw.upper()
+    for code in CURRENCY_CODES:
+        cleaned = re.sub(rf"(?<![A-Z]){re.escape(code)}(?![A-Z)", " ", cleaned)
+    cleaned = cleaned.replace("﷼", " ").replace("د.إ", " ")
+    cleaned = cleaned.replace("$", " ").replace("€", " ").replace("£", " ").replace("¥", " ")
+    cleaned = re.sub(r"\b(INC\.?|EX\.?)\s*VAT\b", " ", cleaned)
+    cleaned = re.sub(r"\b\+?\s*VAT\b", " ", cleaned)
+    cleaned = re.sub(r"\bPER\s+(SET|PCS?|UNIT|PAIR|KIT)\b", " ", cleaned)
+    cleaned = re.sub(r"/\s*(SET|PCS?|PCS|UNIT|PAIR|KIT)\b", " ", cleaned)
+    cleaned = cleaned.replace(",", "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    # Numeric extraction. Do not invent a value if multiple unrelated
+    # numbers are present.
+    matches = re.findall(r"(?<![A-Z])[-+]?(?:\d+(?:\.\d+)?|\.\d+)", cleaned)
+
+    if not matches:
+        return None, currency or fallback_currency, "MISSING", "no_numeric_value"
+
+    if len(matches) > 1:
+        # If the raw field has multiple numbers, mark ambiguous rather
+        # than guessing which one is the price.
+        return None, currency or fallback_currency, "AMBIGUOUS", "multiple_numeric_values"
 
     try:
-        return float(s)
+        value = float(matches[0])
     except ValueError:
-        return None
+        return None, currency or fallback_currency, "MISSING", "numeric_parse_failed"
 
+    if not math.isfinite(value) or value < 0:
+        return None, currency or fallback_currency, "MISSING", "invalid_numeric_value"
 
-def read_uploaded(uploaded):
+    if currency:
+        return value, currency, "EXTRACTED", ""
+    if fallback_currency:
+        return value, str(fallback_currency).upper().strip(), "CONTEXT", ""
+    return value, None, "CONTEXT", "currency_not_found"
+
+def read_uploaded_file(uploaded):
     name = uploaded.name.lower()
     data = uploaded.getvalue()
-
     if name.endswith(".csv"):
-        try:
-            return {"Sheet1": pd.read_csv(io.BytesIO(data))}
-        except UnicodeDecodeError:
-            return {
-                "Sheet1": pd.read_csv(
-                    io.BytesIO(data),
-                    encoding="latin1"
-                )
-            }
+        # Try common encodings.
+        for enc in ["utf-8-sig", "utf-8", "cp1256", "latin1"]:
+            try:
+                return {"Sheet1": pd.read_csv(io.BytesIO(data), encoding=enc)}
+            except Exception:
+                pass
+        raise ValueError("Could not read CSV.")
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(io.BytesIO(data), sheet_name=None)
+    raise ValueError("Unsupported file type. Use CSV or Excel.")
 
-    xls = pd.ExcelFile(io.BytesIO(data))
+def guess_column(columns, keywords):
+    upper = {str(c).upper(): c for c in columns}
+    for key in keywords:
+        for uc, original in upper.items():
+            if key in uc:
+                return original
+    return None
+
+def make_mapping(df):
+    cols = list(df.columns)
     return {
-        sheet: pd.read_excel(
-            io.BytesIO(data),
-            sheet_name=sheet
-        )
-        for sheet in xls.sheet_names
+        "part_number": guess_column(cols, ["PART NUMBER", "PART_NO", "PARTNO", "PART", "OEM"]),
+        "price": guess_column(cols, ["PRICE", "COST", "AMOUNT", "VALUE"]),
+        "brand": guess_column(cols, ["BRAND", "MAKE"]),
+        "description": guess_column(cols, ["DESCRIPTION", "DESC", "NAME"]),
+        "category": guess_column(cols, ["CATEGORY", "GROUP"]),
+        "quantity": guess_column(cols, ["QUANTITY", "QTY"]),
+        "currency": guess_column(cols, ["CURRENCY", "CUR"]),
+        "vat_rate": guess_column(cols, ["VAT RATE", "VAT"]),
+        "supplier": guess_column(cols, ["SUPPLIER", "VENDOR"]),
+        "source_url": guess_column(cols, ["SOURCE URL", "URL", "LINK"]),
+        "observation_date": guess_column(cols, ["DATE", "UPDATED", "OBSERVATION"]),
     }
 
-
-def suggest_mapping(columns):
-    suggestions = {}
-    normalized = {c: clean_col(c) for c in columns}
-
-    for field, aliases in FIELD_ALIASES.items():
-        best = None
-
-        # Exact alias match first
-        for col, value in normalized.items():
-            if value in aliases:
-                best = col
-                break
-
-        # Then partial match
-        if best is None:
-            for col, value in normalized.items():
-                if any(alias in value for alias in aliases):
-                    best = col
-                    break
-
-        suggestions[field] = best
-
-    return suggestions
-
-
-def add_file_to_session(uploaded):
-    """
-    Sequential file storage.
-    Each file is retained independently.
-    """
-    file_id = f"{uploaded.name}__{len(st.session_state.files)}"
-
-    sheets = read_uploaded(uploaded)
-
-    st.session_state.files[file_id] = {
-        "filename": uploaded.name,
-        "sheets": sheets,
-        "active_sheet": list(sheets.keys())[0],
-        "processed": False,
-    }
-
-    return file_id
-
-
-def remove_file(file_id):
-    st.session_state.files.pop(file_id, None)
-    st.session_state.mapped_outputs.pop(file_id, None)
-
-
-def build_rows(
-    df,
-    mapping,
-    metadata,
-    filename,
-    sheet_name,
-):
+def build_rows(df, mapping, meta):
     out = pd.DataFrame(index=df.index)
 
-    # Initialize all fields
-    for field in CANONICAL_FIELDS:
-        out[field] = ""
+    def mapped(name):
+        col = mapping.get(name)
+        return df[col] if col and col in df.columns else pd.Series([""] * len(df), index=df.index)
 
-    def get(field):
-        col = mapping.get(field)
+    # Raw source values are retained.
+    raw_part = mapped("part_number")
+    raw_price = mapped("price")
 
-        if col and col in df.columns:
-            return df[col]
+    out["source_file"] = meta["source_file"]
+    out["source_sheet"] = meta["source_sheet"]
+    out["part_number"] = raw_part.map(clean_text)
+    out["normalized_part_number"] = raw_part.map(normalize_part_number)
 
-        return pd.Series(
-            [""] * len(df),
-            index=df.index
-        )
+    # FIX: actually apply file-level brand to output.
+    brand_col = mapping.get("brand")
+    if brand_col and brand_col in df.columns:
+        out["brand"] = df[brand_col].map(clean_text).str.upper()
+        out["brand_source"] = "SOURCE_COLUMN"
+    else:
+        out["brand"] = str(meta.get("brand") or "").strip().upper()
+        out["brand_source"] = "USER_ASSIGNED_FILE_LEVEL"
 
-    raw_part = get("part_number")
-    raw_price = get("price")
-    raw_qty = get("quantity")
-    raw_date = get("date")
+    out["description"] = mapped("description").map(clean_text)
+    out["category"] = mapped("category").map(clean_text)
+    out["market"] = meta.get("target_market", "")
+    out["country"] = meta.get("source_country", "")
+    out["currency"] = ""
+    out["raw_price"] = raw_price.map(lambda x: "" if pd.isna(x) else str(x))
 
-    out["part_number"] = raw_part
-    out["normalized_part_number"] = raw_part.map(
-        normalize_part_number
-    )
+    parsed = [parse_price(x, meta.get("currency")) for x in raw_price]
+    out["price"] = [x[0] for x in parsed]
+    out["currency"] = [x[1] for x in parsed]
+    out["price_parse_status"] = [x[2] for x in parsed]
+    parse_reasons = [x[3] for x in parsed]
 
-    out["description"] = get("description")
-    out["brand"] = get("brand")
-    out["category"] = get("category")
-    out["quantity"] = raw_qty.map(parse_numeric)
-    out["price"] = raw_price.map(parse_numeric)
+    # Price basis fields start empty; they must be supplied/verified later.
+    out["price_ex_vat"] = ""
+    out["price_inc_vat"] = ""
+    out["vat_rate"] = ""
+    out["vat_status"] = meta.get("vat_status", "VAT_UNKNOWN")
 
-    # File-level context
-    for key in [
-        "brand_source",
-        "market",
-        "country",
-        "currency",
-        "price_type",
-        "supplier",
-        "supplier_type",
-        "authorized_status",
-        "source",
-        "source_type",
-        "price_evidence_level",
-        "source_url",
-        "source_location",
-        "shipping_adjustment_pct",
-        "vat_rate",
-        "vat_status",
-        "notes",
-    ]:
-        if key in metadata:
-            out[key] = metadata[key]
+    out["quantity"] = mapped("quantity").map(clean_text)
+    out["price_type"] = meta.get("price_type", "UNKNOWN")
+    out["supplier"] = mapped("supplier").map(clean_text)
+    out["supplier_type"] = meta.get("supplier_type", "")
+    out["authorized_status"] = meta.get("authorized_status", "")
+    out["source"] = meta.get("source_name", "")
+    out["source_type"] = meta.get("source_type", "")
+    out["price_evidence_level"] = meta.get("evidence_level", "")
+    out["observation_date"] = mapped("observation_date").map(clean_text)
+    out["source_url"] = mapped("source_url").map(clean_text)
+    out["source_location"] = meta.get("source_location", "")
+    out["shipping_adjustment_pct"] = pd.to_numeric(
+        pd.Series([meta.get("shipping_adjustment_pct", 0)] * len(out)), errors="coerce"
+    ).fillna(0.0)
+    out["shipping_adjustment"] = out["price"] * out["shipping_adjustment_pct"] / 100.0
+    out["benchmark_price"] = out["price"] + out["shipping_adjustment"]
 
-    # If a brand column is mapped, it overrides file-level brand.
-    if mapping.get("brand"):
-        out["brand"] = get("brand")
-        out["brand_source"] = "COLUMN_IN_FILE"
-
-    # Observation date
-    out["observation_date"] = metadata.get(
-        "observation_date",
-        str(date.today())
-    )
-
-    if mapping.get("date"):
-        parsed_dates = pd.to_datetime(
-            raw_date,
-            errors="coerce"
-        )
-
-        fallback_date = metadata.get(
-            "observation_date",
-            str(date.today())
-        )
-
-        out["observation_date"] = (
-            parsed_dates
-            .dt.strftime("%Y-%m-%d")
-            .fillna(fallback_date)
-        )
-
-    # VAT calculations
-    vat_rate = pd.to_numeric(
-        out["vat_rate"],
-        errors="coerce"
-    )
-
-    out["vat_rate"] = vat_rate
-
-    out["vat_status"] = (
-        out["vat_status"]
-        .replace("", "VAT_UNKNOWN")
-    )
-
-    out["price_ex_vat"] = None
-    out["price_inc_vat"] = None
-
+    reasons = []
+    valid = []
     for i, row in out.iterrows():
-        price = row["price"]
-        vr = row["vat_rate"]
-        status = str(
-            row["vat_status"]
-        ).upper()
+        r = []
+        if not row["normalized_part_number"]:
+            r.append("missing_part_number")
+        if row["price_parse_status"] in ["MISSING", "AMBIGUOUS"]:
+            r.append("missing_or_unreadable_price")
+        if not row["brand"]:
+            r.append("missing_brand")
+        if not row["currency"]:
+            r.append("missing_currency")
+        if parse_reasons[i]:
+            r.append(parse_reasons[i])
+        reasons.append("; ".join(dict.fromkeys(r)))
+        valid.append(len(r) == 0)
 
-        if pd.isna(price):
-            continue
+    out["valid"] = valid
+    out["rejection_reason"] = reasons
+    out["notes"] = meta.get("notes", "")
 
-        if (
-            status == "VAT_INCLUDED"
-            and pd.notna(vr)
-        ):
-            out.at[i, "price_ex_vat"] = (
-                price / (1 + vr / 100)
-            )
-            out.at[i, "price_inc_vat"] = price
+    return out[CANONICAL_COLUMNS]
 
-        elif status == "VAT_EXCLUDED":
-            out.at[i, "price_ex_vat"] = price
+def file_fingerprint(uploaded):
+    return hashlib.sha256(uploaded.getvalue()).hexdigest()[:12]
 
-            if pd.notna(vr):
-                out.at[i, "price_inc_vat"] = (
-                    price * (1 + vr / 100)
-                )
-
-        else:
-            out.at[i, "price_ex_vat"] = price
-
-    # --------------------------------------------------------
-    # Benchmark adjustment
-    #
-    # IMPORTANT:
-    # observed price is never changed.
-    # --------------------------------------------------------
-
-    pct = pd.to_numeric(
-        out["shipping_adjustment_pct"],
-        errors="coerce"
-    ).fillna(0)
-
-    out["shipping_adjustment"] = (
-        pd.to_numeric(
-            out["price"],
-            errors="coerce"
-        ) * pct / 100
-    )
-
-    out["benchmark_price"] = (
-        pd.to_numeric(
-            out["price"],
-            errors="coerce"
-        )
-        + out["shipping_adjustment"]
-    )
-
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
-
-    out["valid"] = True
-    out["rejection_reason"] = ""
-
-    for i, row in out.iterrows():
-        reasons = []
-
-        if not str(
-            row["part_number"]
-        ).strip():
-            reasons.append(
-                "missing_part_number"
-            )
-
-        if pd.isna(row["price"]):
-            reasons.append(
-                "missing_or_unreadable_price"
-            )
-
-        if not str(
-            row["currency"]
-        ).strip():
-            reasons.append(
-                "missing_currency"
-            )
-
-        if not str(
-            row["market"]
-        ).strip():
-            reasons.append(
-                "missing_market"
-            )
-
-        if (
-            not str(
-                row["price_type"]
-            ).strip()
-            or str(
-                row["price_type"]
-            ).upper() == "UNKNOWN"
-        ):
-            reasons.append(
-                "price_type_unknown"
-            )
-
-        if not str(
-            row["source"]
-        ).strip():
-            reasons.append(
-                "missing_source"
-            )
-
-        if not str(
-            row["brand"]
-        ).strip():
-            reasons.append(
-                "missing_brand"
-            )
-
-        if reasons:
-            out.at[i, "valid"] = False
-            out.at[i, "rejection_reason"] = (
-                "; ".join(reasons)
-            )
-
-    out["source_file"] = filename
-    out["source_sheet"] = sheet_name
-
-    return out
-
-
-def combined_output():
-    if not st.session_state.mapped_outputs:
-        return None
-
-    return pd.concat(
-        st.session_state.mapped_outputs.values(),
-        ignore_index=True
-    )
-
-
-# ------------------------------------------------------------
-# Session state
-# ------------------------------------------------------------
+# ============================================================
+# UI
+# ============================================================
+st.title("Ajalty Intelligent Pricing Engine — MVP Dataset Builder R03")
+st.caption("Deterministic ingestion/normalization layer. R03 fixes file-level brand assignment and robust commercial price parsing.")
 
 if "files" not in st.session_state:
-    st.session_state.files = {}
+    st.session_state.files = []
 
-if "mapped_outputs" not in st.session_state:
-    st.session_state.mapped_outputs = {}
-
-if "uploader_key" not in st.session_state:
-    st.session_state.uploader_key = 0
-
-
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
-
-st.title(
-    "Ajalty Intelligent Pricing Engine — MVP Dataset Builder"
-)
-
-st.caption(
-    "G1 Dataset Preparation • R02 • "
-    "Sequential multi-file workflow"
-)
-
-st.info(
-    "Current MVP scope: genuine OEM Toyota. "
-    "The application architecture is brand-dynamic; "
-    "Toyota is a configurable MVP scope rather than a hard-coded "
-    "assumption."
-)
-
-
-# ------------------------------------------------------------
-# Current dataset status
-# ------------------------------------------------------------
-
-combined = combined_output()
-
-if combined is not None:
-    total = len(combined)
-    valid = int(combined["valid"].sum())
-    review = total - valid
-else:
-    total = valid = review = 0
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric(
-    "Files added",
-    len(st.session_state.files)
-)
-
-c2.metric(
-    "Observations",
-    total
-)
-
-c3.metric(
-    "Valid",
-    valid
-)
-
-c4.metric(
-    "Needs review",
-    review
-)
-
-
-# ============================================================
-# ADD FILE
-# ============================================================
-
-st.header("1. Add source file")
-
+st.subheader("1. Add source file")
 uploaded = st.file_uploader(
-    "Upload one Excel/CSV file",
-    type=["xlsx", "xls", "csv"],
-    accept_multiple_files=False,
-    key=f"uploader_{st.session_state.uploader_key}",
+    "Upload CSV or Excel",
+    type=["csv", "xlsx", "xlsm", "xls"],
+    key="uploader"
 )
 
-if uploaded is not None:
-
-    existing_names = [
-        item["filename"]
-        for item in st.session_state.files.values()
-    ]
-
-    if uploaded.name not in existing_names:
-
+if uploaded:
+    fp = file_fingerprint(uploaded)
+    existing = [x["fingerprint"] for x in st.session_state.files]
+    if fp not in existing:
         try:
-            file_id = add_file_to_session(
-                uploaded
-            )
-
-            st.success(
-                f"Added: {uploaded.name}"
-            )
-
-            # Reset uploader so the next file can be selected.
-            st.session_state.uploader_key += 1
-
-            st.rerun()
-
+            sheets = read_uploaded_file(uploaded)
+            first_sheet = next(iter(sheets))
+            df = sheets[first_sheet]
+            st.session_state.current = {
+                "fingerprint": fp,
+                "filename": uploaded.name,
+                "sheets": sheets,
+                "sheet": first_sheet,
+                "df": df,
+                "mapping": make_mapping(df)
+            }
         except Exception as e:
-            st.error(
-                f"Could not read {uploaded.name}: {e}"
-            )
+            st.error(str(e))
 
-    else:
-        st.warning(
-            "This filename is already in the current dataset."
+if "current" in st.session_state:
+    cur = st.session_state.current
+    sheets = cur["sheets"]
+
+    cur["sheet"] = st.selectbox("Sheet", list(sheets.keys()), index=list(sheets.keys()).index(cur["sheet"]))
+    cur["df"] = sheets[cur["sheet"]]
+    df = cur["df"]
+
+    st.write(f"Preview: **{len(df):,} rows × {len(df.columns)} columns**")
+    st.dataframe(df.head(10), use_container_width=True)
+
+    st.subheader("2. Map source columns")
+    cols = ["(none)"] + list(df.columns)
+    auto = cur["mapping"]
+
+    def select_map(label, key, required=False):
+        default = auto.get(key)
+        idx = cols.index(default) if default in cols else 0
+        return st.selectbox(label, cols, index=idx, key=f"map_{key}")
+
+    mapping = {}
+    mapping["part_number"] = select_map("Part number *", "part_number")
+    mapping["price"] = select_map("Price *", "price")
+    mapping["brand"] = select_map("Brand (optional)", "brand")
+    mapping["description"] = select_map("Description", "description")
+    mapping["category"] = select_map("Category", "category")
+    mapping["quantity"] = select_map("Quantity", "quantity")
+    mapping["currency"] = select_map("Currency column (optional)", "currency")
+    mapping["vat_rate"] = select_map("VAT rate column (optional)", "vat_rate")
+    mapping["supplier"] = select_map("Supplier", "supplier")
+    mapping["source_url"] = select_map("Source URL", "source_url")
+    mapping["observation_date"] = select_map("Observation date", "observation_date")
+
+    # Remove sentinel.
+    mapping = {k: (None if v == "(none)" else v) for k, v in mapping.items()}
+
+    st.subheader("3. Source classification")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        brand = st.text_input(
+            "File-level brand",
+            value="" if mapping.get("brand") else "TOYOTA",
+            help="Used only when no brand column is mapped."
+        )
+        source_name = st.text_input("Source / supplier name")
+        source_type = st.selectbox(
+            "Source type",
+            ["OEM_DEALERSHIP", "AUTHORIZED_DISTRIBUTOR", "WHOLESALER",
+             "MARKETPLACE", "CUSTOMER_TRANSACTION", "PUBLIC_OEM", "OTHER"]
+        )
+    with c2:
+        source_country = st.text_input("Source country", value="Saudi Arabia")
+        source_location = st.text_input("Source location", value="Saudi Arabia")
+        target_market = st.text_input("Target market", value="Saudi Arabia")
+    with c3:
+        currency = st.selectbox("Default currency", [""] + CURRENCY_CODES, index=1 if "SAR" in CURRENCY_CODES else 0)
+        price_type = st.selectbox(
+            "Price type",
+            ["WHOLESALE", "TRADE", "DISTRIBUTOR", "DEALER", "RETAIL",
+             "MSRP", "PUBLIC_OEM", "MARKETPLACE", "QUOTE", "TRANSACTION", "UNKNOWN"]
+        )
+        vat_status = st.selectbox("VAT status", ["VAT_UNKNOWN", "VAT_INCLUDED", "VAT_EXCLUDED"])
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        supplier_type = st.selectbox(
+            "Supplier type",
+            ["DEALERSHIP", "AUTHORIZED_DISTRIBUTOR", "WHOLESALER",
+             "MARKETPLACE_SELLER", "CUSTOMER", "OTHER", ""]
+        )
+    with c5:
+        authorized_status = st.selectbox(
+            "Authorized status",
+            ["VERIFIED", "NOT_VERIFIED", "UNKNOWN"]
+        )
+    with c6:
+        evidence_level = st.selectbox("Evidence level", ["S1", "S2", "S3", "S4", "S5", "UNKNOWN"])
+
+    shipping_pct = st.number_input(
+        "Shipping / location adjustment % (explicit assumption; does NOT alter observed price)",
+        value=0.0, step=0.5, format="%.2f"
+    )
+    notes = st.text_area("Notes / verification comments")
+
+    st.subheader("4. Validate this file")
+    if st.button("Process & Add File", type="primary"):
+        # If a currency column is mapped, use its first non-empty value as
+        # a fallback only. Explicit currency embedded in price still wins.
+        fallback_currency = currency
+        if mapping.get("currency"):
+            vals = df[mapping["currency"]].dropna().astype(str).str.strip()
+            if len(vals):
+                detected = detect_currency(vals.iloc[0])
+                if detected:
+                    fallback_currency = detected
+
+        meta = {
+            "source_file": uploaded.name,
+            "source_sheet": cur["sheet"],
+            "brand": brand,
+            "target_market": target_market,
+            "source_country": source_country,
+            "currency": fallback_currency,
+            "vat_status": vat_status,
+            "price_type": price_type,
+            "supplier_type": supplier_type,
+            "authorized_status": authorized_status,
+            "source_name": source_name,
+            "source_type": source_type,
+            "evidence_level": evidence_level,
+            "source_location": source_location,
+            "shipping_adjustment_pct": shipping_pct,
+            "notes": notes,
+        }
+
+        result = build_rows(df, mapping, meta)
+
+        # Apply mapped currency column where the price itself has no currency.
+        if mapping.get("currency"):
+            for i, v in df[mapping["currency"]].items():
+                if result.at[i, "price_parse_status"] == "CONTEXT":
+                    cc = detect_currency(v)
+                    if cc:
+                        result.at[i, "currency"] = cc
+                    elif clean_text(v):
+                        result.at[i, "currency"] = clean_text(v).upper()
+
+        # Re-evaluate currency validity.
+        result["valid"] = result["valid"] & result["currency"].fillna("").astype(str).str.strip().ne("")
+        result.loc[result["currency"].fillna("").astype(str).str.strip().eq(""), "rejection_reason"] = (
+            result.loc[result["currency"].fillna("").astype(str).str.strip().eq(""), "rejection_reason"]
+            .astype(str).str.replace(r"(?<!missing_currency)(^|; )missing_currency", "missing_currency", regex=True)
         )
 
-
-# ============================================================
-# FILE PROCESSING
-# ============================================================
+        st.session_state.files.append({
+            "fingerprint": fp,
+            "name": uploaded.name,
+            "data": result
+        })
+        del st.session_state.current
+        st.rerun()
 
 if st.session_state.files:
-
-    st.header("2. Configure and map files")
-
-    for number, (file_id, file_info) in enumerate(
-        list(st.session_state.files.items()),
-        start=1,
-    ):
-
-        filename = file_info["filename"]
-        sheets = file_info["sheets"]
-
-        with st.expander(
-            f"{number}. {filename}",
-            expanded=(not file_info["processed"]),
-        ):
-
-            # ------------------------------------------------
-            # Sheet
-            # ------------------------------------------------
-
-            active_sheet = st.selectbox(
-                "Sheet",
-                list(sheets.keys()),
-                index=list(
-                    sheets.keys()
-                ).index(
-                    file_info["active_sheet"]
-                ),
-                key=f"sheet_{file_id}",
-            )
-
-            file_info["active_sheet"] = active_sheet
-
-            df = sheets[active_sheet].copy()
-
-            # ------------------------------------------------
-            # Preview
-            # ------------------------------------------------
-
-            st.markdown(
-                "### File preview"
-            )
-
-            st.dataframe(
-                df.head(8),
-                use_container_width=True,
-                height=250,
-            )
-
-            st.caption(
-                f"{len(df):,} rows × "
-                f"{len(df.columns):,} columns"
-            )
-
-            # ------------------------------------------------
-            # File designation
-            # ------------------------------------------------
-
-            st.markdown(
-                "### Source designation"
-            )
-
-            preset_name = st.selectbox(
-                "What does this file represent?",
-                list(SOURCE_PRESETS.keys()),
-                key=f"preset_{file_id}",
-            )
-
-            preset = SOURCE_PRESETS[
-                preset_name
-            ].copy()
-
-            # ------------------------------------------------
-            # Brand context
-            # ------------------------------------------------
-
-            st.markdown(
-                "### Brand identification"
-            )
-
-            brand_column_options = [
-                "— No brand column —"
-            ] + list(df.columns)
-
-            suggestions = suggest_mapping(
-                df.columns.tolist()
-            )
-
-            suggested_brand = suggestions.get(
-                "brand"
-            )
-
-            default_brand_index = (
-                brand_column_options.index(
-                    suggested_brand
-                )
-                if suggested_brand
-                in brand_column_options
-                else 0
-            )
-
-            brand_column = st.selectbox(
-                "Brand column (if the file contains one)",
-                brand_column_options,
-                index=default_brand_index,
-                key=f"brand_column_{file_id}",
-            )
-
-            if (
-                brand_column
-                != "— No brand column —"
-            ):
-
-                brand_source = (
-                    "COLUMN_IN_FILE"
-                )
-
-                brand_value = ""
-
-                st.success(
-                    f"Brand will be taken from: "
-                    f"{brand_column}"
-                )
-
-            else:
-
-                brand_source = (
-                    "USER_ASSIGNED_FILE_LEVEL"
-                )
-
-                brand_value = st.text_input(
-                    "Brand for the entire file",
-                    value="TOYOTA",
-                    key=f"brand_value_{file_id}",
-                    help=(
-                        "Use this when every row in the "
-                        "file belongs to the same brand. "
-                        "Do not infer silently."
-                    ),
-                ).strip().upper()
-
-                if brand_value:
-
-                    if brand_value not in [
-                        b.upper()
-                        for b in MVP_ALLOWED_BRANDS
-                    ]:
-
-                        st.warning(
-                            f"{brand_value} is outside the "
-                            f"current MVP brand scope "
-                            f"({', '.join(MVP_ALLOWED_BRANDS)}). "
-                            "It can still be stored for future "
-                            "multi-brand use, but should not be "
-                            "included in the current Toyota MVP."
-                        )
-
-            # ------------------------------------------------
-            # Context
-            # ------------------------------------------------
-
-            st.markdown(
-                "### Market / source context"
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-
-            with c1:
-
-                market = st.text_input(
-                    "Target market",
-                    value=preset["market"],
-                    key=f"market_{file_id}",
-                )
-
-                country = st.text_input(
-                    "Country",
-                    value=preset["country"],
-                    key=f"country_{file_id}",
-                )
-
-            with c2:
-
-                currency = st.text_input(
-                    "Currency",
-                    value=preset["currency"],
-                    key=f"currency_{file_id}",
-                ).strip().upper()
-
-                source_type = st.selectbox(
-                    "Source type",
-                    SOURCE_TYPES,
-                    index=(
-                        SOURCE_TYPES.index(
-                            preset["source_type"]
-                        )
-                        if preset["source_type"]
-                        in SOURCE_TYPES
-                        else 5
-                    ),
-                    key=f"source_type_{file_id}",
-                )
-
-            with c3:
-
-                price_type = st.selectbox(
-                    "Price type",
-                    PRICE_TYPES,
-                    index=PRICE_TYPES.index(
-                        preset["price_type"]
-                    ),
-                    key=f"price_type_{file_id}",
-                )
-
-                evidence = st.selectbox(
-                    "Evidence level",
-                    [1, 2, 3, 4, 5],
-                    index=(
-                        int(
-                            preset[
-                                "price_evidence_level"
-                            ]
-                        ) - 1
-                    ),
-                    key=f"evidence_{file_id}",
-                    help=(
-                        "1 = strongest evidence; "
-                        "5 = general marketplace/web evidence."
-                    ),
-                )
-
-            with c4:
-
-                source_location = st.text_input(
-                    "Price/source location",
-                    value=preset[
-                        "source_location"
-                    ],
-                    key=f"location_{file_id}",
-                )
-
-                obs_date = st.date_input(
-                    "Observation date",
-                    value=date.today(),
-                    key=f"date_{file_id}",
-                )
-
-            source_name = st.text_input(
-                "Source name / reference",
-                value=(
-                    preset_name
-                    if preset_name
-                    != "Other / custom"
-                    else filename
-                ),
-                key=f"source_{file_id}",
-            )
-
-            supplier = st.text_input(
-                "Supplier / seller",
-                value=preset[
-                    "supplier_type"
-                ],
-                key=f"supplier_{file_id}",
-            )
-
-            # ------------------------------------------------
-            # Adjustments
-            # ------------------------------------------------
-
-            st.markdown(
-                "### Benchmark adjustment"
-            )
-
-            st.caption(
-                "This is deliberately separate from the "
-                "observed price. It is an assumption used "
-                "only to create a comparable benchmark."
-            )
-
-            a1, a2, a3 = st.columns(3)
-
-            with a1:
-
-                shipping_pct = st.number_input(
-                    "Shipping / location adjustment (%)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=0.0,
-                    step=0.5,
-                    key=f"shipping_{file_id}",
-                )
-
-            with a2:
-
-                vat_status = st.selectbox(
-                    "VAT status",
-                    [
-                        "VAT_UNKNOWN",
-                        "VAT_INCLUDED",
-                        "VAT_EXCLUDED",
-                    ],
-                    key=f"vat_status_{file_id}",
-                )
-
-            with a3:
-
-                st.write(
-                    "Example:"
-                )
-                st.code(
-                    "Observed 100\n"
-                    "Adjustment 5%\n"
-                    "Benchmark 105"
-                )
-
-            # ------------------------------------------------
-            # Column mapping
-            # ------------------------------------------------
-
-            st.markdown(
-                "### Column mapping"
-            )
-
-            st.caption(
-                "Review every important mapping. "
-                "The suggested mapping is only a starting point."
-            )
-
-            mapping = {}
-
-            mapping_fields = [
-                "part_number",
-                "description",
-                "quantity",
-                "price",
-                "brand",
-                "category",
-                "date",
-                "source_url",
-            ]
-
-            map_cols = st.columns(3)
-
-            for n, field in enumerate(
-                mapping_fields
-            ):
-
-                with map_cols[n % 3]:
-
-                    options = [
-                        "— Not mapped —"
-                    ] + list(df.columns)
-
-                    suggested = suggestions.get(
-                        field
-                    )
-
-                    default_index = (
-                        options.index(
-                            suggested
-                        )
-                        if suggested
-                        in options
-                        else 0
-                    )
-
-                    selected = st.selectbox(
-                        field,
-                        options,
-                        index=default_index,
-                        key=f"map_{file_id}_{field}",
-                    )
-
-                    if (
-                        selected
-                        != "— Not mapped —"
-                    ):
-
-                        mapping[field] = (
-                            selected
-                        )
-
-            # If brand is assigned from a file-level value,
-            # don't allow a stale brand mapping to override it.
-            if (
-                brand_column
-                != "— No brand column —"
-            ):
-
-                mapping["brand"] = (
-                    brand_column
-                )
-
-            # ------------------------------------------------
-            # Process
-            # ------------------------------------------------
-
-            metadata = {
-                "brand_source": brand_source,
-                "market": market,
-                "country": country,
-                "currency": currency,
-                "price_type": price_type,
-                "source": source_name,
-                "source_type": source_type,
-                "price_evidence_level": evidence,
-                "source_location": source_location,
-                "observation_date": str(
-                    obs_date
-                ),
-                "shipping_adjustment_pct": (
-                    shipping_pct
-                ),
-                "vat_status": vat_status,
-                "supplier": supplier,
-                "supplier_type": preset[
-                    "supplier_type"
-                ],
-                "authorized_status": preset[
-                    "authorized_status"
-                ],
-                "notes": "",
-            }
-
-            # File-level brand only if there is no brand column.
-            if (
-                brand_column
-                == "— No brand column —"
-            ):
-
-                metadata["brand"] = (
-                    brand_value
-                )
-
-            if st.button(
-                "Process / Update this file",
-                key=f"process_{file_id}",
-                type="primary",
-            ):
-
-                result = build_rows(
-                    df=df,
-                    mapping=mapping,
-                    metadata=metadata,
-                    filename=filename,
-                    sheet_name=active_sheet,
-                )
-
-                st.session_state.mapped_outputs[
-                    file_id
-                ] = result
-
-                file_info[
-                    "processed"
-                ] = True
-
-                st.success(
-                    f"Processed {len(result):,} rows."
-                )
-
-            # ------------------------------------------------
-            # Preview processed
-            # ------------------------------------------------
-
-            if (
-                file_id
-                in st.session_state.mapped_outputs
-            ):
-
-                result = (
-                    st.session_state
-                    .mapped_outputs[file_id]
-                )
-
-                valid_count = int(
-                    result["valid"].sum()
-                )
-
-                invalid_count = (
-                    len(result)
-                    - valid_count
-                )
-
-                p1, p2, p3 = st.columns(3)
-
-                p1.metric(
-                    "Rows imported",
-                    len(result),
-                )
-
-                p2.metric(
-                    "Valid",
-                    valid_count,
-                )
-
-                p3.metric(
-                    "Needs review",
-                    invalid_count,
-                )
-
-                st.dataframe(
-                    result[
-                        [
-                            "part_number",
-                            "normalized_part_number",
-                            "brand",
-                            "quantity",
-                            "currency",
-                            "price",
-                            "benchmark_price",
-                            "price_type",
-                            "source_type",
-                            "valid",
-                            "rejection_reason",
-                        ]
-                    ].head(20),
-                    use_container_width=True,
-                    height=300,
-                )
-
-            # ------------------------------------------------
-            # Remove
-            # ------------------------------------------------
-
-            if st.button(
-                "Remove this file",
-                key=f"remove_{file_id}",
-            ):
-
-                remove_file(file_id)
-
-                st.rerun()
-
-
-# ============================================================
-# COMBINED DATASET
-# ============================================================
-
-combined = combined_output()
-
-if combined is not None:
-
     st.divider()
+    st.subheader("5. Files added")
 
-    st.header(
-        "3. Combined benchmark dataset"
+    for idx, item in enumerate(st.session_state.files):
+        data = item["data"]
+        valid_n = int(data["valid"].sum())
+        st.write(f"**{idx+1}. {item['name']}** — {len(data):,} rows | valid: {valid_n:,} | rejected: {len(data)-valid_n:,}")
+        if st.button(f"Remove {idx+1}", key=f"remove_{idx}"):
+            st.session_state.files.pop(idx)
+            st.rerun()
+
+    combined = pd.concat([x["data"] for x in st.session_state.files], ignore_index=True)
+
+    st.subheader("6. Combined preview")
+    st.dataframe(combined.head(50), use_container_width=True)
+
+    st.write("### Validation summary")
+    summary = (
+        combined.groupby(["valid"], dropna=False)
+        .size()
+        .rename("rows")
+        .reset_index()
     )
+    st.dataframe(summary, use_container_width=True)
 
-    total = len(combined)
-    valid_count = int(
-        combined["valid"].sum()
-    )
-    review_count = (
-        total - valid_count
-    )
-
-    m1, m2, m3, m4 = st.columns(4)
-
-    m1.metric(
-        "Total observations",
-        total,
-    )
-
-    m2.metric(
-        "Valid observations",
-        valid_count,
-    )
-
-    m3.metric(
-        "Needs review",
-        review_count,
-    )
-
-    m4.metric(
-        "Unique parts",
-        combined[
-            "normalized_part_number"
-        ]
-        .replace("", pd.NA)
-        .nunique(),
-    )
-
-    # --------------------------------------------------------
-    # Brand summary
-    # --------------------------------------------------------
-
-    st.markdown(
-        "### Brand summary"
-    )
-
-    brand_summary = (
-        combined["brand"]
-        .replace("", "UNKNOWN")
+    rejection = (
+        combined.loc[~combined["valid"], "rejection_reason"]
+        .fillna("")
+        .replace("", "unknown")
         .value_counts()
-        .rename_axis("brand")
-        .reset_index(
-            name="observations"
-        )
+        .rename_axis("rejection_reason")
+        .reset_index(name="rows")
     )
+    st.dataframe(rejection.head(30), use_container_width=True)
 
-    st.dataframe(
-        brand_summary,
-        hide_index=True,
-        use_container_width=True,
-    )
+    csv_bytes = combined.to_csv(index=False).encode("utf-8-sig")
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+        combined.to_excel(writer, index=False, sheet_name="benchmark")
+        rejection.to_excel(writer, index=False, sheet_name="rejections")
+    xlsx_buf.seek(0)
 
-    # Current MVP warning
-    non_toyota = combined[
-        ~combined["brand"]
-        .astype(str)
-        .str.upper()
-        .isin(
-            MVP_ALLOWED_BRANDS
-        )
-        & combined["brand"].astype(str).ne("")
-    ]
-
-    if len(non_toyota) > 0:
-
-        st.warning(
-            f"{len(non_toyota):,} observations "
-            "are outside the current Toyota MVP scope. "
-            "They remain in the dataset for future "
-            "multi-brand support but should not yet be "
-            "used by the Toyota MVP model."
-        )
-
-    # --------------------------------------------------------
-    # Main table
-    # --------------------------------------------------------
-
-    display_cols = [
-        c for c in [
-            "source_file",
-            "source_sheet",
-            "part_number",
-            "normalized_part_number",
-            "brand",
-            "brand_source",
-            "description",
-            "category",
-            "market",
-            "country",
-            "currency",
-            "price",
-            "price_ex_vat",
-            "price_inc_vat",
-            "vat_rate",
-            "vat_status",
-            "quantity",
-            "price_type",
-            "supplier",
-            "supplier_type",
-            "authorized_status",
-            "source",
-            "source_type",
-            "price_evidence_level",
-            "observation_date",
-            "source_url",
-            "source_location",
-            "shipping_adjustment_pct",
-            "shipping_adjustment",
-            "benchmark_price",
-            "valid",
-            "rejection_reason",
-            "notes",
-        ]
-        if c in combined.columns
-    ]
-
-    st.dataframe(
-        combined[display_cols].head(200),
-        use_container_width=True,
-        height=500,
-    )
-
-    # --------------------------------------------------------
-    # Data quality
-    # --------------------------------------------------------
-
-    st.markdown(
-        "### Data quality summary"
-    )
-
-    summary = pd.DataFrame(
-        {
-            "metric": [
-                "Total observations",
-                "Valid observations",
-                "Rows needing review",
-                "Unique normalized parts",
-                "Toyota observations",
-                "Unknown brand observations",
-                "Saudi observations",
-                "UAE observations",
-                "Marketplace observations",
-                "Actual transaction observations",
-                "Dealership observations",
-            ],
-            "value": [
-                len(combined),
-                int(
-                    combined[
-                        "valid"
-                    ].sum()
-                ),
-                int(
-                    (
-                        ~combined[
-                            "valid"
-                        ]
-                    ).sum()
-                ),
-                combined[
-                    "normalized_part_number"
-                ]
-                .replace("", pd.NA)
-                .nunique(),
-                int(
-                    combined[
-                        "brand"
-                    ]
-                    .astype(str)
-                    .str.upper()
-                    .eq("TOYOTA")
-                    .sum()
-                ),
-                int(
-                    combined[
-                        "brand"
-                    ]
-                    .astype(str)
-                    .str.strip()
-                    .eq("")
-                    .sum()
-                ),
-                int(
-                    combined[
-                        "market"
-                    ]
-                    .astype(str)
-                    .str.contains(
-                        "Saudi",
-                        case=False,
-                        na=False,
-                    )
-                    .sum()
-                ),
-                int(
-                    combined[
-                        "market"
-                    ]
-                    .astype(str)
-                    .str.contains(
-                        "UAE",
-                        case=False,
-                        na=False,
-                    )
-                    .sum()
-                ),
-                int(
-                    combined[
-                        "source_type"
-                    ]
-                    .astype(str)
-                    .eq("MARKETPLACE")
-                    .sum()
-                ),
-                int(
-                    combined[
-                        "source_type"
-                    ]
-                    .astype(str)
-                    .eq(
-                        "ACTUAL_TRANSACTION"
-                    )
-                    .sum()
-                ),
-                int(
-                    combined[
-                        "source_type"
-                    ]
-                    .astype(str)
-                    .eq("DEALERSHIP")
-                    .sum()
-                ),
-            ],
-        }
-    )
-
-    st.dataframe(
-        summary,
-        hide_index=True,
-        use_container_width=True,
-    )
-
-    st.warning(
-        "Review rows marked invalid/needs review before "
-        "using the dataset as evidence. Missing information "
-        "is not silently guessed."
-    )
-
-    # --------------------------------------------------------
-    # Downloads
-    # --------------------------------------------------------
-
-    csv_bytes = combined[
-        display_cols
-    ].to_csv(
-        index=False
-    ).encode(
-        "utf-8-sig"
-    )
-
-    xlsx_buffer = io.BytesIO()
-
-    with pd.ExcelWriter(
-        xlsx_buffer,
-        engine="openpyxl",
-    ) as writer:
-
-        combined[
-            display_cols
-        ].to_excel(
-            writer,
-            index=False,
-            sheet_name="benchmark_v01",
-        )
-
-        summary.to_excel(
-            writer,
-            index=False,
-            sheet_name="data_quality",
-        )
-
-        brand_summary.to_excel(
-            writer,
-            index=False,
-            sheet_name="brand_summary",
-        )
-
-    d1, d2 = st.columns(2)
-
-    with d1:
-
+    c1, c2 = st.columns(2)
+    with c1:
         st.download_button(
-            "Download benchmark_v01.csv",
-            data=csv_bytes,
-            file_name="benchmark_v01.csv",
-            mime="text/csv",
-            use_container_width=True,
+            "Download combined CSV",
+            csv_bytes,
+            file_name="benchmark_R03.csv",
+            mime="text/csv"
         )
-
-    with d2:
-
+    with c2:
         st.download_button(
-            "Download benchmark_v01.xlsx",
-            data=xlsx_buffer.getvalue(),
-            file_name="benchmark_v01.xlsx",
-            mime=(
-                "application/"
-                "vnd.openxmlformats-officedocument"
-                ".spreadsheetml.sheet"
-            ),
-            use_container_width=True,
+            "Download combined Excel",
+            xlsx_buf.getvalue(),
+            file_name="benchmark_R03.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-
-else:
-
-    st.markdown(
-        """
-        ### Workflow
-
-        **Add File → Preview → Designate → Identify Brand →
-        Map Columns → Process → Add Another File → Combine → Export**
-
-        The current MVP is Toyota-only for model development,
-        but the dataset itself supports multiple brands.
-        """
+    st.info(
+        "R03 intentionally does not calculate an inferred wholesale price. "
+        "Observed price and benchmark_price remain separate. "
+        "The next MVP stage is deterministic validation/normalization and the ratio baseline."
     )
