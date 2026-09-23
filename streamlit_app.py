@@ -808,10 +808,34 @@ def build_rows(df, mapping, meta):
                         value
                     ).upper()
 
-    # These remain blank unless explicitly supplied/verified.
-    out["price_ex_vat"] = ""
-    out["price_inc_vat"] = ""
-    out["vat_rate"] = ""
+    # G2 VAT basis. Preserve source price; derive EX-VAT deterministically.
+    row_vat_col = mapping.get("vat_rate")
+    if row_vat_col and row_vat_col in df.columns:
+        out["vat_rate"] = df[row_vat_col].map(
+            lambda value: parse_vat_rate(value, meta.get("vat_rate"))
+        )
+    else:
+        out["vat_rate"] = meta.get("vat_rate", "")
+
+    out["price_ex_vat"] = pd.NA
+    out["price_inc_vat"] = pd.NA
+
+    observed_prices = pd.to_numeric(out["price"], errors="coerce")
+    parsed_vat = pd.to_numeric(out["vat_rate"], errors="coerce")
+
+    if str(meta.get("vat_status", "VAT_UNKNOWN")).upper() == "VAT_EXCLUDED":
+        # Source price is already EX-VAT. No VAT rate is required.
+        out["price_ex_vat"] = observed_prices
+        # Only calculate inclusive price when an explicit VAT rate exists.
+        out["price_inc_vat"] = observed_prices * (1.0 + parsed_vat)
+
+    elif str(meta.get("vat_status", "VAT_UNKNOWN")).upper() == "VAT_INCLUDED":
+        # Inclusive source price requires an explicit VAT rate to derive EX-VAT.
+        valid_vat = parsed_vat.notna()
+        out.loc[valid_vat, "price_inc_vat"] = observed_prices[valid_vat]
+        out.loc[valid_vat, "price_ex_vat"] = (
+            observed_prices[valid_vat] / (1.0 + parsed_vat[valid_vat])
+        )
 
     out["vat_status"] = meta.get(
         "vat_status",
