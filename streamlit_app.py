@@ -2,6 +2,7 @@ import io
 import re
 import math
 import hashlib
+from datetime import date
 
 import pandas as pd
 import streamlit as st
@@ -793,9 +794,12 @@ def build_rows(df, mapping, meta):
         "UNKNOWN"
     )
 
-    out["observation_date"] = mapped(
-        "observation_date"
-    ).map(clean_text)
+    # R05: use one user-selected observation date for the whole file.
+    # This keeps observations from different files consistent.
+    out["observation_date"] = meta.get(
+        "observation_date",
+        ""
+    )
 
     out["source_url"] = mapped(
         "source_url"
@@ -921,6 +925,9 @@ if "upload_slot" not in st.session_state:
 if "current" not in st.session_state:
     st.session_state.current = None
 
+if "upload_enabled" not in st.session_state:
+    st.session_state.upload_enabled = True
+
 
 # ------------------------------------------------------------
 # Header
@@ -995,73 +1002,76 @@ with st.expander(
 
 
 # ------------------------------------------------------------
-# Current uploaded file
+# Upload / current file
 # ------------------------------------------------------------
 
-if st.session_state.current is None:
+st.subheader(
+    "1. Add source file"
+)
 
-    st.subheader(
-        "1. Add source file"
+if st.session_state.files:
+    st.caption(
+        f"{len(st.session_state.files)} file(s) already processed. "
+        "Upload another file below; previously processed files are retained."
     )
 
-    uploaded = st.file_uploader(
-        "Upload CSV or Excel",
-        type=[
-            "csv",
-            "xlsx",
-            "xlsm",
-            "xls",
-        ],
-        key=f"uploader_{st.session_state.upload_slot}",
-    )
+uploaded = st.file_uploader(
+    "Upload one CSV or Excel file at a time",
+    type=[
+        "csv",
+        "xlsx",
+        "xlsm",
+        "xls",
+    ],
+    key=f"uploader_{st.session_state.upload_slot}",
+)
 
-    if uploaded is not None:
+if uploaded is not None and st.session_state.current is None:
 
-        fingerprint = file_fingerprint(
-            uploaded
+    fingerprint = file_fingerprint(uploaded)
+
+    already_added = [
+        item["fingerprint"]
+        for item in st.session_state.files
+    ]
+
+    if fingerprint in already_added:
+
+        st.warning(
+            "This exact file has already been added. "
+            "Choose a different file."
         )
 
-        already_added = [
-            item["fingerprint"]
-            for item in st.session_state.files
-        ]
+    else:
 
-        if fingerprint in already_added:
+        try:
 
-            st.warning(
-                "This exact file has already been added."
+            sheets = read_uploaded_file(
+                uploaded
             )
 
-        else:
+            first_sheet = next(
+                iter(sheets)
+            )
 
-            try:
+            df = sheets[first_sheet]
 
-                sheets = read_uploaded_file(
-                    uploaded
-                )
+            st.session_state.current = {
+                "fingerprint": fingerprint,
+                "filename": uploaded.name,
+                "sheets": sheets,
+                "sheet": first_sheet,
+                "df": df,
+                "mapping": make_mapping(df),
+            }
 
-                first_sheet = next(
-                    iter(sheets)
-                )
+            st.rerun()
 
-                df = sheets[first_sheet]
+        except Exception as error:
 
-                st.session_state.current = {
-                    "fingerprint": fingerprint,
-                    "filename": uploaded.name,
-                    "sheets": sheets,
-                    "sheet": first_sheet,
-                    "df": df,
-                    "mapping": make_mapping(df),
-                }
-
-                st.rerun()
-
-            except Exception as error:
-
-                st.error(
-                    f"Could not read file: {error}"
-                )
+            st.error(
+                f"Could not read file: {error}"
+            )
 
 
 # ------------------------------------------------------------
@@ -1193,11 +1203,6 @@ if st.session_state.current is not None:
         "source_url"
     )
 
-    mapping["observation_date"] = mapping_selector(
-        "Observation date",
-        "observation_date"
-    )
-
     mapping = {
         field: (
             None
@@ -1270,6 +1275,16 @@ if st.session_state.current is not None:
             "Target market",
             value="Saudi Arabia",
             key="target_market",
+        )
+
+        observation_date = st.date_input(
+            "Observation date",
+            value=date.today(),
+            help=(
+                "One date is assigned to all observations in this file "
+                "to keep the benchmark dataset consistent."
+            ),
+            key="observation_date_picker",
         )
 
     with col3:
@@ -1418,6 +1433,7 @@ if st.session_state.current is not None:
                 "target_market": target_market,
                 "source_country": source_country,
                 "currency": currency,
+                "observation_date": observation_date.isoformat(),
                 "vat_status": vat_status,
                 "price_type": price_type,
                 "supplier_type": supplier_type,
@@ -1454,13 +1470,14 @@ if st.session_state.current is not None:
                 st.session_state.current = None
 
                 # IMPORTANT:
-                # Change uploader key so Streamlit gives us
-                # a fresh uploader for the next file.
+                # Change uploader key so Streamlit creates a
+                # completely new upload control. This allows
+                # file 3, 4, 5, etc. without replacing prior files.
                 st.session_state.upload_slot += 1
 
                 st.success(
-                    f"Added {current['filename']} "
-                    f"successfully."
+                    f"Added {current['filename']} successfully. "
+                    f"{len(st.session_state.files)} file(s) are now retained."
                 )
 
                 st.rerun()
@@ -1553,20 +1570,6 @@ if st.session_state.files:
 
                 st.rerun()
 
-    # --------------------------------------------------------
-    # Add another file button
-    # --------------------------------------------------------
-
-    if st.button(
-        "➕ Add Another File",
-        key="add_another_file",
-    ):
-
-        st.session_state.current = None
-        st.session_state.upload_slot += 1
-        st.rerun()
-
-
 # ------------------------------------------------------------
 # Combined dataset
 # ------------------------------------------------------------
@@ -1585,6 +1588,19 @@ if st.session_state.files:
 
     st.subheader(
         "7. Combined dataset"
+    )
+
+    observation_dates = sorted(
+        combined["observation_date"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    st.caption(
+        "Observation date(s) currently in the combined dataset: "
+        + (", ".join(observation_dates) if observation_dates else "None")
     )
 
     st.write(
