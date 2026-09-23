@@ -9,7 +9,7 @@ import streamlit as st
 
 # ============================================================
 # Ajalty Intelligent Pricing Engine — MVP
-# Dataset Builder R04
+# Dataset Builder R06
 #
 # R04 is a controlled update of R03.1.
 #
@@ -61,6 +61,11 @@ CANONICAL_COLUMNS = [
     "price_inc_vat",
     "vat_rate",
     "vat_status",
+    "fx_rate_to_sar",
+    "fx_date",
+    "fx_source",
+    "normalized_price_sar",
+    "normalization_status",
     "quantity",
     "price_type",
     "supplier",
@@ -75,6 +80,8 @@ CANONICAL_COLUMNS = [
     "shipping_adjustment_pct",
     "shipping_adjustment",
     "benchmark_price",
+    "shipping_adjustment_sar",
+    "adjusted_benchmark_price_sar",
     "valid",
     "rejection_reason",
     "notes",
@@ -149,6 +156,11 @@ FIELD_DEFINITIONS = {
     "price_inc_vat": "Price including VAT when explicitly established.",
     "vat_rate": "VAT percentage where available.",
     "vat_status": "VAT_INCLUDED, VAT_EXCLUDED, or VAT_UNKNOWN.",
+    "fx_rate_to_sar": "Manual FX rate converting the observation currency to SAR; SAR uses 1.0.",
+    "fx_date": "Date associated with the manually supplied FX rate.",
+    "fx_source": "Reference/source recorded for the FX rate; MVP does not fetch live FX automatically.",
+    "normalized_price_sar": "Comparable price in SAR on an EX-VAT basis when VAT status/rate permits deterministic normalization.",
+    "normalization_status": "NORMALIZED, VAT_UNKNOWN, VAT_RATE_REQUIRED, FX_MISSING, or INVALID_PRICE.",
     "quantity": "Quantity associated with the price.",
     "price_type": "WHOLESALE, TRADE, RETAIL, MARKETPLACE, TRANSACTION, etc.",
     "supplier": "Supplier/vendor name where available.",
@@ -162,7 +174,9 @@ FIELD_DEFINITIONS = {
     "source_location": "Geographic location of the source price.",
     "shipping_adjustment_pct": "Explicit location/shipping adjustment assumption.",
     "shipping_adjustment": "Calculated adjustment amount; does not overwrite observed price.",
-    "benchmark_price": "Observed price plus explicit adjustment. Not the final predicted market price.",
+    "benchmark_price": "Observed price plus explicit adjustment in the original observation currency. Not the final predicted market price.",
+    "shipping_adjustment_sar": "Shipping/location adjustment calculated from normalized SAR price; does not alter observed price.",
+    "adjusted_benchmark_price_sar": "Normalized SAR price plus explicit shipping/location adjustment. Not the final predicted market price.",
     "valid": "Whether the observation passes the current deterministic validation checks.",
     "rejection_reason": "Reason a row failed validation.",
     "notes": "Manual verification/comments.",
@@ -354,6 +368,54 @@ def parse_price(raw_value, fallback_currency=None):
         )
 
     return value, None, "CONTEXT", "currency_not_found"
+
+
+# ------------------------------------------------------------
+# VAT / normalization helpers
+# ------------------------------------------------------------
+
+def parse_vat_rate(value, fallback=None):
+    """Return VAT as decimal (e.g. 15% -> 0.15). Never infer a rate."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text.replace(",", ""))
+    if not match:
+        return fallback
+    try:
+        number = float(match.group(0))
+    except ValueError:
+        return fallback
+    if not math.isfinite(number) or number < 0:
+        return fallback
+    # Explicit percent sign or conventional 0-100 input.
+    if "%" in text or number > 1:
+        return number / 100.0
+    return number
+
+
+def detect_file_currencies(df, mapping, fallback_currency=None):
+    """Detect currencies from parsed price text and optional currency column."""
+    found = set()
+    price_col = mapping.get("price")
+    currency_col = mapping.get("currency")
+    if price_col and price_col in df.columns:
+        for value in df[price_col]:
+            c = detect_currency(value)
+            if c:
+                found.add(c)
+    if currency_col and currency_col in df.columns:
+        for value in df[currency_col]:
+            c = detect_currency(value)
+            if c:
+                found.add(c)
+            elif clean_text(value):
+                found.add(clean_text(value).upper())
+    if fallback_currency:
+        found.add(str(fallback_currency).upper().strip())
+    return sorted(x for x in found if x)
 
 
 # ------------------------------------------------------------
@@ -753,6 +815,11 @@ def build_rows(df, mapping, meta):
 
     out["vat_status"] = meta.get(
         "vat_status",
+    "fx_rate_to_sar",
+    "fx_date",
+    "fx_source",
+    "normalized_price_sar",
+    "normalization_status",
         "VAT_UNKNOWN"
     )
 
@@ -834,6 +901,40 @@ def build_rows(df, mapping, meta):
         numeric_price
         + out["shipping_adjustment"]
     )
+
+    # G2: normalize to SAR on an EX-VAT basis. FX is supplied manually
+    # for reproducibility; original price/currency are preserved.
+    fx_rates = meta.get("fx_rates_to_sar", {}) or {}
+    fx_date = meta.get("fx_date", "")
+    fx_source = meta.get("fx_source", "")
+    out["fx_rate_to_sar"] = out["currency"].map(
+        lambda c: 1.0 if str(c).upper() == "SAR" else fx_rates.get(str(c).upper())
+    )
+    out["fx_date"] = fx_date
+    out["fx_source"] = fx_source
+    out["normalized_price_sar"] = pd.NA
+    out["normalization_status"] = ""
+
+    for index, row in out.iterrows():
+        fx = row["fx_rate_to_sar"]
+        ex_vat = pd.to_numeric(pd.Series([row["price_ex_vat"]]), errors="coerce").iloc[0]
+        currency_value = clean_text(row["currency"]).upper()
+        if pd.isna(row["price"]):
+            status = "INVALID_PRICE"
+        elif not currency_value or pd.isna(fx) or float(fx) <= 0:
+            status = "FX_MISSING"
+        elif vat_status == "VAT_UNKNOWN":
+            status = "VAT_UNKNOWN"
+        elif pd.isna(ex_vat):
+            status = "VAT_RATE_REQUIRED"
+        else:
+            out.at[index, "normalized_price_sar"] = float(ex_vat) * float(fx)
+            status = "NORMALIZED"
+        out.at[index, "normalization_status"] = status
+
+    normalized = pd.to_numeric(out["normalized_price_sar"], errors="coerce")
+    out["shipping_adjustment_sar"] = normalized * adjustment_pct / 100.0
+    out["adjusted_benchmark_price_sar"] = normalized + out["shipping_adjustment_sar"]
 
     # --------------------------------------------------------
     # Validation
@@ -938,7 +1039,7 @@ st.title(
 )
 
 st.caption(
-    "R04 — Dataset Builder / Evidence & Validation Layer"
+    "R06 — Dataset Builder / G2 Currency & VAT Normalization"
 )
 
 
@@ -1324,6 +1425,51 @@ if st.session_state.current is not None:
             key="vat_status",
         )
 
+    # --------------------------------------------------------
+    # G2 currency + VAT normalization configuration
+    # --------------------------------------------------------
+
+    st.subheader("5. G2 — Currency & VAT normalization")
+
+    vat_col_values = []
+    if mapping.get("vat_rate") and mapping["vat_rate"] in df.columns:
+        vat_col_values = [parse_vat_rate(v) for v in df[mapping["vat_rate"]]]
+        vat_col_values = [v for v in vat_col_values if v is not None]
+    default_vat_rate_pct = (sum(vat_col_values) / len(vat_col_values) * 100) if vat_col_values else 0.0
+
+    norm_col1, norm_col2 = st.columns(2)
+    with norm_col1:
+        file_vat_rate = st.number_input(
+            "Default VAT rate %", value=float(default_vat_rate_pct), min_value=0.0, max_value=100.0, step=0.5, format="%.2f",
+            help="Used only where no row-level VAT rate is mapped. This is not applied when VAT status is UNKNOWN."
+        )
+        fx_date = st.date_input(
+            "FX rate date", value=observation_date,
+            help="Date associated with the manually entered FX rates."
+        )
+    with norm_col2:
+        fx_source = st.text_input(
+            "FX source / reference", value="Manual",
+            help="Record the reference used for the rate. R06 does not fetch live FX automatically."
+        )
+
+    detected_currencies = detect_file_currencies(df, mapping, currency)
+    st.caption("Detected currencies: " + (", ".join(detected_currencies) if detected_currencies else "None"))
+    fx_rates_to_sar = {}
+    if detected_currencies:
+        fx_cols = st.columns(min(4, max(1, len(detected_currencies))))
+        for i, cur in enumerate(detected_currencies):
+            with fx_cols[i % len(fx_cols)]:
+                if cur == "SAR":
+                    st.number_input("SAR → SAR", value=1.0, disabled=True, key=f"fx_{cur}")
+                    fx_rates_to_sar[cur] = 1.0
+                else:
+                    fx_rates_to_sar[cur] = st.number_input(
+                        f"{cur} → SAR", min_value=0.0, value=0.0, step=0.0001, format="%.6f",
+                        key=f"fx_{cur}",
+                        help=f"Enter how many SAR equal 1 {cur}."
+                    )
+
     col4, col5, col6 = st.columns(3)
 
     with col4:
@@ -1387,7 +1533,7 @@ if st.session_state.current is not None:
     # --------------------------------------------------------
 
     st.subheader(
-        "5. Process file"
+        "6. Process file"
     )
 
     process_file = st.button(
@@ -1422,6 +1568,11 @@ if st.session_state.current is not None:
 
         else:
 
+            missing_fx = [c for c in detected_currencies if c != "SAR" and not fx_rates_to_sar.get(c)]
+            if missing_fx:
+                st.error("Enter an FX rate to SAR for: " + ", ".join(missing_fx))
+                st.stop()
+
             metadata = {
                 "source_file": current[
                     "filename"
@@ -1435,6 +1586,10 @@ if st.session_state.current is not None:
                 "currency": currency,
                 "observation_date": observation_date.isoformat(),
                 "vat_status": vat_status,
+                "vat_rate": file_vat_rate,
+                "fx_rates_to_sar": fx_rates_to_sar,
+                "fx_date": fx_date.isoformat(),
+                "fx_source": fx_source,
                 "price_type": price_type,
                 "supplier_type": supplier_type,
                 "authorized_status": authorized_status,
@@ -1655,6 +1810,27 @@ if st.session_state.files:
     )
 
     # --------------------------------------------------------
+    # G2 normalization summary
+    # --------------------------------------------------------
+
+    st.subheader("9. G2 Normalization summary")
+    normalization_counts = (
+        combined["normalization_status"]
+        .fillna("UNKNOWN")
+        .value_counts()
+        .rename_axis("normalization_status")
+        .reset_index(name="rows")
+    )
+    st.dataframe(normalization_counts, use_container_width=True, hide_index=True)
+
+    currency_summary = (
+        combined.groupby("currency", dropna=False)
+        .agg(rows=("currency", "size"), normalized=("normalized_price_sar", lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())))
+        .reset_index()
+    )
+    st.dataframe(currency_summary, use_container_width=True, hide_index=True)
+
+    # --------------------------------------------------------
     # Rejection summary
     # --------------------------------------------------------
 
@@ -1703,7 +1879,7 @@ if st.session_state.files:
     # --------------------------------------------------------
 
     st.subheader(
-        "10. Validation details"
+        "11. Validation details"
     )
 
     st.caption(
@@ -1780,6 +1956,11 @@ if st.session_state.files:
         "price",
         "currency",
         "price_parse_status",
+        "vat_status",
+        "vat_rate",
+        "fx_rate_to_sar",
+        "normalized_price_sar",
+        "normalization_status",
         "quantity",
         "price_type",
         "valid",
@@ -1804,7 +1985,7 @@ if st.session_state.files:
     # --------------------------------------------------------
 
     st.subheader(
-        "11. Source file quality summary"
+        "12. Source file quality summary"
     )
 
     source_summary = (
@@ -1835,7 +2016,7 @@ if st.session_state.files:
     # --------------------------------------------------------
 
     st.subheader(
-        "12. Export"
+        "13. Export"
     )
 
     csv_bytes = combined.to_csv(
@@ -1894,7 +2075,7 @@ if st.session_state.files:
         st.download_button(
             "Download combined CSV",
             csv_bytes,
-            file_name="benchmark_R04.csv",
+            file_name="benchmark_R06.csv",
             mime="text/csv",
             key="download_csv",
         )
@@ -1904,7 +2085,7 @@ if st.session_state.files:
         st.download_button(
             "Download combined Excel",
             excel_buffer.getvalue(),
-            file_name="benchmark_R04.xlsx",
+            file_name="benchmark_R06.xlsx",
             mime=(
                 "application/vnd.openxmlformats-"
                 "officedocument.spreadsheetml.sheet"
@@ -1917,7 +2098,7 @@ if st.session_state.files:
     # --------------------------------------------------------
 
     st.info(
-        "R04 is still the deterministic ingestion and "
+        "R06 is still the deterministic ingestion and "
         "validation layer. It does not infer the final "
         "Saudi market price. Observed price, adjusted "
         "benchmark observation, and future predicted price "
